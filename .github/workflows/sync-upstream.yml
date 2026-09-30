@@ -9,6 +9,10 @@ on:
   schedule:
     - cron: "17 3 1,16 * *" # 03:17 UTC = 11:17 Beijing time
   workflow_dispatch:
+  # Editing this workflow runs it once, which also registers it before `custom` becomes the default branch
+  push:
+    branches: [custom]
+    paths: [.github/workflows/sync-upstream.yml]
 
 concurrency:
   group: sync-upstream
