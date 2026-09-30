@@ -1,0 +1,107 @@
+name: Sync upstream
+
+# On the 1st and 16th of each month, merge xai-org/grok-build `main` into `custom`, check the carried fix still passes its tests, push, and rebuild the release.
+# A conflict or a failing test leaves `custom` untouched and fails the run (GitHub emails the repo owner), and opens an issue when Issues are enabled.
+# GitHub runs scheduled workflows only from the default branch, so `custom` must be the fork's default branch for the schedule to fire.
+# It merges rather than rebases: a merge never rewrites the commit that adds these workflows, which the workflow token is not allowed to push.
+
+on:
+  schedule:
+    - cron: "17 3 1,16 * *" # 03:17 UTC = 11:17 Beijing time
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: xai-org/grok-build
+  BRANCH: custom
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPO.git" main
+          upstream="$(git rev-parse FETCH_HEAD)"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "result=up-to-date" >> "$GITHUB_OUTPUT"
+            echo "\`$BRANCH\` already contains $UPSTREAM_REPO@${upstream::8}; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          elif git merge --no-edit -m "Merge upstream $UPSTREAM_REPO@${upstream::8}" "$upstream"; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "result=blocked"
+              echo "files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      # The sampler crates hold the carried fix and its tests; they build without protoc
+      - name: Test the carried fix on the merge
+        id: test
+        if: steps.merge.outputs.result == 'merged'
+        run: cargo test -p xai-grok-sampler -p xai-grok-sampling-types --locked
+
+      # Pushes made with the workflow token trigger no workflows, so the rebuild is dispatched explicitly
+      - name: Push and rebuild
+        if: steps.merge.outputs.result == 'merged'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+        run: |
+          git push origin "HEAD:$BRANCH"
+          gh workflow run custom-build.yml --ref "$BRANCH"
+          echo "Merged $UPSTREAM_REPO@${UPSTREAM::8} into \`$BRANCH\` and started a rebuild." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a sync that needs attention
+        if: failure() || steps.merge.outputs.result == 'blocked'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM: ${{ steps.merge.outputs.upstream }}
+          RESULT: ${{ steps.merge.outputs.result }}
+          FILES: ${{ steps.merge.outputs.files }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = blocked ]; then
+            reason="Merging upstream conflicts in:"$'\n'"$(printf '%s\n' "$FILES" | sed 's/^/- /')"
+          elif [ "$TEST_OUTCOME" = failure ]; then
+            reason="The merge applies cleanly, but the sampler tests fail on it."
+          else
+            reason="The sync failed before it could push; see the run log."
+          fi
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+            "Syncing \`$BRANCH\` with $UPSTREAM_REPO@${UPSTREAM::8} needs a manual merge. \`$BRANCH\` and the release are unchanged." \
+            "$reason" \
+            "Run: $RUN_URL")"
+          echo "$body" >> "$GITHUB_STEP_SUMMARY"
+          title="Upstream sync needs attention ($UPSTREAM_REPO@${UPSTREAM::8})"
+          open="$(gh issue list --state open --search 'in:title "Upstream sync needs attention"' --json number --jq length 2>/dev/null || echo unavailable)"
+          if [ "$open" = 0 ]; then
+            gh issue create --title "$title" --body "$body" || echo "::warning::Could not open an issue"
+          fi
+          exit 1

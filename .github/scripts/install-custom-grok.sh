@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs (or updates) the custom grok published by .github/workflows/custom-build.yml.
 #
-#   curl -fsSL https://raw.githubusercontent.com/soilderone/grok-build/claude/epic-einstein-bvdzja/.github/scripts/install-custom-grok.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/soilderone/grok-build/custom/.github/scripts/install-custom-grok.sh | bash
 #
 # It replaces `grok` where the official installer put it (~/.grok/bin, else ~/.local/bin; override with GROK_INSTALL_DIR),
 # keeps the official one as `grok.official`, and sets `[cli] auto_update = false` so the updater cannot swap the official build back in.

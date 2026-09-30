@@ -2,12 +2,12 @@ name: Custom grok build
 
 # Builds this fork's grok for macOS (Apple silicon) and Linux (x86_64) and publishes both on the rolling `custom-latest` release.
 # Install or update on a machine with:
-#   curl -fsSL https://raw.githubusercontent.com/soilderone/grok-build/claude/epic-einstein-bvdzja/.github/scripts/install-custom-grok.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/soilderone/grok-build/custom/.github/scripts/install-custom-grok.sh | bash
 
 on:
   workflow_dispatch:
   push:
-    branches: [claude/epic-einstein-bvdzja]
+    branches: [custom]
     paths:
       - "crates/**"
       - "third_party/**"
@@ -17,7 +17,7 @@ on:
       - ".github/workflows/custom-build.yml"
 
 concurrency:
-  group: custom-build
+  group: custom-build-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -84,6 +84,8 @@ jobs:
 
   publish:
     needs: build
+    # Only the maintained branch may replace the release the installer downloads
+    if: github.ref == 'refs/heads/custom'
     runs-on: ubuntu-latest
     permissions:
       contents: write
