@@ -1,0 +1,106 @@
+name: Custom grok build
+
+# Builds this fork's grok for macOS (Apple silicon) and Linux (x86_64) and publishes both on the rolling `custom-latest` release.
+# Install or update on a machine with:
+#   curl -fsSL https://raw.githubusercontent.com/soilderone/grok-build/claude/epic-einstein-bvdzja/.github/scripts/install-custom-grok.sh | bash
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/epic-einstein-bvdzja]
+    paths:
+      - "crates/**"
+      - "third_party/**"
+      - "prod/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/custom-build.yml"
+
+concurrency:
+  group: custom-build
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # One-shot CI builds gain nothing from incremental artifacts, which only cost disk
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04's glibc keeps the binary runnable on older distributions
+          - os: ubuntu-22.04
+            asset: grok-linux-x86_64
+          - os: macos-14
+            asset: grok-macos-arm64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: actions/checkout@v4
+
+      # bin/protoc needs DotSlash; the build falls back to a protoc on PATH
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          else
+            brew install protobuf
+          fi
+          protoc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.asset }}
+
+      - name: Build
+        run: cargo build -p xai-grok-pager-bin --release --locked
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/xai-grok-pager dist/grok
+          # Stripping would invalidate the ad-hoc code signature macOS requires, so only Linux is stripped
+          if [ "$RUNNER_OS" = Linux ]; then strip dist/grok; fi
+          ./dist/grok --version
+          tar -czf "${{ matrix.asset }}.tar.gz" -C dist grok
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the custom-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete custom-latest --yes --cleanup-tag || true
+          gh release create custom-latest dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Custom grok (${GITHUB_SHA::7})" \
+            --notes "Built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. Install or update with: curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/.github/scripts/install-custom-grok.sh | bash"
