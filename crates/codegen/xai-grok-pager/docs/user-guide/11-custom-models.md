@@ -287,6 +287,10 @@ env_key = "OPENAI_API_KEY"
 
 On the Responses API, Grok asks for a `concise` reasoning summary by default; that is what the reasoning text shown in the UI comes from. `reasoning_summary` changes the request: `detailed` or `auto` for a fuller summary, or `none` to omit the field for gateways that reject it.
 
+### Relays and prompt caching
+
+On `chat_completions` and `responses`, Grok sends `session_id` and `x-session-id` headers that stay the same for a whole conversation (the Responses body also carries it as `prompt_cache_key`). Relays that pool several upstream accounts use them to keep a conversation on one account, whose prompt cache is already warm; without them each turn can land on a cold cache. A value you set yourself in `extra_headers` takes precedence.
+
 ### AWS Bedrock (Mantle)
 
 Bedrock's OpenAI-compatible gateway rejects `reasoning.summary`, so set `reasoning_summary = "none"`. It authenticates with a Bedrock API key as a bearer token; the example below mints a short-lived one through a named auth provider:

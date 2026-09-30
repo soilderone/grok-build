@@ -18,6 +18,24 @@ use crate::events::{SamplingChannel, SamplingErrorInfo, SamplingEvent};
 use crate::metrics::InferenceLatencyStats;
 use crate::types::RequestId;
 
+/// The placeholder some relays emit when their upstream stream dies: a `length` stop with nothing but whitespace, at most one billed completion token, and usage that reports the entire prompt as cached.
+/// Even an empty real cut (context exhaustion) leaves the prompt's newest tokens uncached, so the fully cached prompt is what sets the placeholder apart.
+fn is_relay_placeholder_length_stop(
+    content: &str,
+    reasoning: &str,
+    tool_calls: &[ToolCall],
+    usage: Option<&TokenUsage>,
+) -> bool {
+    tool_calls.is_empty()
+        && reasoning.is_empty()
+        && content.trim().is_empty()
+        && usage.is_some_and(|u| {
+            u.completion_tokens <= 1
+                && u.prompt_tokens > 0
+                && u.cached_prompt_tokens == u.prompt_tokens
+        })
+}
+
 /// The output stream emits exactly one terminal event per request.
 /// Callers must not consume past the terminal event (the implementation `return`s after yielding it).
 pub fn stream_chat_completions<'a>(
@@ -238,6 +256,33 @@ pub fn stream_chat_completions<'a>(
                 arguments: std::sync::Arc::<str>::from(arguments),
             })
             .collect();
+
+        // Some OpenAI-compatible relays turn a dead upstream stream into this `length` stop; failing it as `MaxTokensTruncation` would claim the model hit its output limit and never retry
+        if finish_reason == Some(StopReason::Length)
+            && is_relay_placeholder_length_stop(
+                &content_acc,
+                &reasoning_acc,
+                &tool_calls,
+                usage.as_ref(),
+            )
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                "relay placeholder length stop; treating as a retryable stream error"
+            );
+            let err = SamplingError::StreamError {
+                error_type: "upstream_stream_incomplete".to_owned(),
+                message: "The provider ended the stream with an empty length stop; \
+                          its upstream stream likely dropped"
+                    .to_owned(),
+                code: None,
+            };
+            yield SamplingEvent::Failed {
+                request_id: request_id.clone(),
+                error: SamplingErrorInfo::from(&err),
+            };
+            return;
+        }
 
         // Tool calls override the stop reason, even an explicit `length`.
         // NOTE: the Messages backend has the opposite precedence: Length wins there
@@ -870,6 +915,79 @@ mod tests {
                 assert_eq!(response.cost_usd_ticks, Some(99));
             }
             other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    fn usage_chunk(prompt: u32, completion: u32, cached: u32) -> ChatCompletionChunk {
+        let mut chunk = make_chunk(vec![]);
+        chunk.usage = Some(Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            prompt_tokens_details: Some(xai_grok_sampling_types::PromptTokensDetails {
+                cached_tokens: cached,
+                audio_tokens: 0,
+            }),
+            completion_tokens_details: None,
+            cost_in_usd_ticks: None,
+        });
+        chunk
+    }
+
+    async fn run(chunks: Vec<ChatCompletionChunk>) -> Vec<SamplingEvent> {
+        let raw = stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>()).boxed();
+        collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await
+    }
+
+    /// The frames a relay sent after losing its upstream mid-turn: one blank token, a `length` stop, and usage billing the whole prompt as cached.
+    /// That must fail the attempt retryably, not complete as a truncation the turn loop reports as "the model hit its output limit".
+    #[tokio::test]
+    async fn relay_placeholder_length_stop_fails_retryably() {
+        let events = run(vec![
+            text_chunk(" "),
+            final_chunk(FinishReason::Length),
+            usage_chunk(12_427, 1, 12_427),
+        ])
+        .await;
+        match events.last().unwrap() {
+            SamplingEvent::Failed { error, .. } => {
+                assert!(error.is_retryable, "{error:?}");
+                assert_eq!(error.kind, crate::events::SamplingErrorKind::Api);
+                assert!(error.message.contains("upstream_stream_incomplete"));
+            }
+            other => panic!("expected a retryable Failed, got {other:?}"),
+        }
+    }
+
+    /// Real `length` stops keep completing as `Length`: one with output, and an empty one whose prompt was not reported as fully cached.
+    #[tokio::test]
+    async fn genuine_length_stops_are_not_placeholders() {
+        for chunks in [
+            vec![
+                text_chunk("cut mid-sent"),
+                final_chunk(FinishReason::Length),
+                usage_chunk(12_427, 4_096, 12_427),
+            ],
+            vec![
+                text_chunk(" "),
+                final_chunk(FinishReason::Length),
+                usage_chunk(12_427, 1, 12_288),
+            ],
+            vec![text_chunk(" "), final_chunk(FinishReason::Length)],
+        ] {
+            let events = run(chunks).await;
+            match events.last().unwrap() {
+                SamplingEvent::Completed { response, .. } => {
+                    assert_eq!(response.stop_reason, Some(StopReason::Length));
+                }
+                other => panic!("expected Completed(Length), got {other:?}"),
+            }
         }
     }
 }

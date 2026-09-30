@@ -51,6 +51,10 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
 
+/// Conversation-scoped headers OpenAI-compatible relays key sticky routing on: Codex's `session_id`, plus `x-session-id` for proxies that drop underscored names.
+/// A relay that pools upstream accounts sends a conversation without them to a different account each turn, and every account's prompt cache starts cold.
+const SESSION_AFFINITY_HEADERS: [&str; 2] = ["session_id", "x-session-id"];
+
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
     conv_id: &'a str,
@@ -119,6 +123,41 @@ pub(crate) fn deserialize_response_event(data: &str) -> Result<rs::ResponseStrea
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+/// Some OpenAI-compatible relays close a stream whose upstream died with a synthesized `response.incomplete`.
+/// It carries a top-level `code`/`message` (fields the Responses API never puts on that event) next to a fabricated `incomplete_details.reason = "max_output_tokens"`.
+/// Taking it at face value reports a transport failure as a Length truncation ("the model hit its output limit"), so surface it as a retryable stream error instead.
+fn relay_synthesized_incomplete_error(data: &str) -> Option<SamplingError> {
+    // Cheap pre-filter: every other event skips the second parse
+    if !data.contains("\"response.incomplete\"") || !data.contains("\"code\"") {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    if value.get("type").and_then(|t| t.as_str()) != Some("response.incomplete") {
+        return None;
+    }
+    let code = value
+        .get("code")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())?;
+    let message = value
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("upstream stream ended before completion");
+    tracing::warn!(
+        code,
+        message,
+        "relay synthesized response.incomplete; treating as a retryable stream error"
+    );
+    Some(SamplingError::StreamError {
+        error_type: code.to_owned(),
+        message: message.to_owned(),
+        code: None,
+    })
 }
 
 /// On `response.completed` / `response.incomplete`, rewrite `usage.total_tokens` to the live context length from `context_details`.
@@ -847,6 +886,26 @@ impl SamplingClient {
         self.endpoint.url_for_path(path)
     }
 
+    /// Stamps [`SESSION_AFFINITY_HEADERS`] with the conversation's stable cache key.
+    /// A header already set through `extra_headers` / `env_http_headers` wins, so the per-request value never duplicates it.
+    fn with_session_affinity(
+        &self,
+        builder: reqwest::RequestBuilder,
+        key: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let Some(value) = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .and_then(|k| HeaderValue::from_str(k).ok())
+        else {
+            return builder;
+        };
+        SESSION_AFFINITY_HEADERS
+            .into_iter()
+            .filter(|name| !self.default_headers.contains_key(*name))
+            .fold(builder, |b, name| b.header(name, value.clone()))
+    }
+
     fn apply_defaults(&self, mut request: ChatCompletionRequest) -> Result<ChatCompletionRequest> {
         if request.model.is_none() {
             request.model = Some(self.defaults.model.clone());
@@ -956,9 +1015,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
-        let built_request = self
-            .build_json_request(grok_headers.apply(builder), &payload)
-            .await?;
+        // Chat Completions has no body cache key; the conv id is what ties a call to its conversation here
+        let builder = self.with_session_affinity(grok_headers.apply(builder), Some(x_grok_conv_id));
+        let built_request = self.build_json_request(builder, &payload).await?;
         let response = self.send(built_request).await?;
 
         let status = response.status();
@@ -1094,8 +1153,9 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("chat/completions"));
-        let http_request = grok_headers
-            .apply(builder)
+        // Chat Completions has no body cache key; the conv id is what ties a call to its conversation here
+        let http_request = self
+            .with_session_affinity(grok_headers.apply(builder), Some(x_grok_conv_id))
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         let built_request = self
             .build_json_request(http_request, &streaming_request)
@@ -1324,9 +1384,11 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let built_request = self
-            .build_json_request(grok_headers.apply(builder), &request_body)
-            .await?;
+        let builder = self.with_session_affinity(
+            grok_headers.apply(builder),
+            request.inner.prompt_cache_key.as_deref(),
+        );
+        let built_request = self.build_json_request(builder, &request_body).await?;
         let response = self.send(built_request).await?;
 
         let status = response.status();
@@ -1474,8 +1536,11 @@ impl SamplingClient {
             builder,
             sent_bearer,
         } = self.post(self.endpoint("responses"));
-        let mut http_request = grok_headers
-            .apply(builder)
+        let mut http_request = self
+            .with_session_affinity(
+                grok_headers.apply(builder),
+                request.inner.prompt_cache_key.as_deref(),
+            )
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         if let Some(policy) = self.defaults.doom_loop_recovery {
             http_request = http_request
@@ -1591,7 +1656,9 @@ impl SamplingClient {
                         };
                         if swallow {
                             Some(None)
-                        } else if let Some(stream_error) = try_parse_stream_error(data) {
+                        } else if let Some(stream_error) = try_parse_stream_error(data)
+                            .or_else(|| relay_synthesized_incomplete_error(data))
+                        {
                             Some(Some(Err(stream_error)))
                         } else {
                             Some(Some(deserialize_response_event(data)))
@@ -2524,6 +2591,34 @@ mod tests {
     ) -> (axum::http::HeaderMap, Bytes) {
         use xai_grok_sampling_types::{ContentPart, ConversationItem, UserItem};
 
+        let request = ConversationRequest {
+            items: vec![ConversationItem::User(UserItem {
+                content: vec![ContentPart::Text {
+                    text: Arc::from(input),
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        };
+        capture_conversation_request(
+            backend,
+            streaming,
+            SamplerConfig {
+                request_compression,
+                ..minimal_config()
+            },
+            request,
+        )
+        .await
+    }
+
+    /// [`capture_request`] with the caller's config (its `base_url` and `api_backend` are overwritten) and request.
+    async fn capture_conversation_request(
+        backend: ApiBackend,
+        streaming: bool,
+        config: SamplerConfig,
+        request: ConversationRequest,
+    ) -> (axum::http::HeaderMap, Bytes) {
         let (content_type, reply) = match (streaming, &backend) {
             (true, _) => ("text/event-stream", "data: [DONE]\n\n"),
             (false, ApiBackend::Responses) => ("application/json", EMPTY_RESPONSE_JSON),
@@ -2556,19 +2651,9 @@ mod tests {
         let client = SamplingClient::new(SamplerConfig {
             base_url: format!("http://{addr}/v1"),
             api_backend: backend.clone(),
-            request_compression,
-            ..minimal_config()
+            ..config
         })
         .unwrap();
-        let request = ConversationRequest {
-            items: vec![ConversationItem::User(UserItem {
-                content: vec![ContentPart::Text {
-                    text: Arc::from(input),
-                }],
-                ..Default::default()
-            })],
-            ..Default::default()
-        };
         let sent = match (streaming, &backend) {
             (false, ApiBackend::ChatCompletions) => client.conversation(request).await.map(drop),
             (true, ApiBackend::ChatCompletions) => {
@@ -2684,6 +2769,174 @@ mod tests {
         assert_eq!(None, header(&headers, CONTENT_ENCODING));
         assert_eq!(Some("application/json"), header(&headers, CONTENT_TYPE));
         assert!(std::str::from_utf8(&body).unwrap().contains(&input));
+    }
+
+    fn session_values<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Vec<&'a str> {
+        headers
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect()
+    }
+
+    /// Relays pin a conversation to one pooled upstream account by these headers; without them every turn lands on a cold prompt cache.
+    /// Chat Completions keys them on the conv id, Responses on the body's `prompt_cache_key` (so a side call's own conv id cannot split it from its parent), and Messages sends none.
+    #[tokio::test]
+    async fn session_affinity_headers_follow_the_conversation_cache_key() {
+        let request = || ConversationRequest {
+            items: vec![xai_grok_sampling_types::ConversationItem::user("hi")],
+            x_grok_conv_id: Some("recap-123".to_owned()),
+            prompt_cache_key: Some("session-abc".to_owned()),
+            ..Default::default()
+        };
+        for (backend, expected) in [
+            (ApiBackend::ChatCompletions, Some("recap-123")),
+            (ApiBackend::Responses, Some("session-abc")),
+            (ApiBackend::Messages, None),
+        ] {
+            for streaming in [false, true] {
+                let route = format!("{backend:?} streaming={streaming}");
+                let (headers, _) = capture_conversation_request(
+                    backend.clone(),
+                    streaming,
+                    minimal_config(),
+                    request(),
+                )
+                .await;
+                let expected: Vec<&str> = expected.into_iter().collect();
+                for name in SESSION_AFFINITY_HEADERS {
+                    assert_eq!(expected, session_values(&headers, name), "{route}: {name}");
+                }
+            }
+        }
+    }
+
+    /// A session header the user configured is sent once, as configured; the other affinity header still rides along.
+    #[tokio::test]
+    async fn configured_session_header_wins_over_the_affinity_default() {
+        let config = SamplerConfig {
+            extra_headers: IndexMap::from([("session_id".to_owned(), "pinned".to_owned())]),
+            ..minimal_config()
+        };
+        let request = ConversationRequest {
+            items: vec![xai_grok_sampling_types::ConversationItem::user("hi")],
+            x_grok_conv_id: Some("session-abc".to_owned()),
+            ..Default::default()
+        };
+        let (headers, _) =
+            capture_conversation_request(ApiBackend::ChatCompletions, true, config, request).await;
+        assert_eq!(vec!["pinned"], session_values(&headers, "session_id"));
+        assert_eq!(
+            vec!["session-abc"],
+            session_values(&headers, "x-session-id")
+        );
+    }
+
+    /// The terminal frame a relay emitted after losing its upstream mid-stream, verbatim apart from shortened ids.
+    const RELAY_SYNTHESIZED_INCOMPLETE: &str = r#"{"type":"response.incomplete","code":"upstream_stream_incomplete","message":"The stream ended before completion. Please retry later.","sequence_number":9,"response":{"id":"resp_ft_1","object":"response","created_at":1790752834,"status":"incomplete","model":"gpt-6-sol","output":[{"content":[{"annotations":[],"text":" ","type":"output_text"}],"id":"msg_ft_1","role":"assistant","status":"completed","type":"message"}],"usage":{"input_tokens":4840,"output_tokens":1,"total_tokens":4841,"input_tokens_details":{"cached_tokens":4840}},"incomplete_details":{"reason":"max_output_tokens"}}}"#;
+
+    #[test]
+    fn relay_synthesized_incomplete_is_a_retryable_stream_error() {
+        let Some(err) = relay_synthesized_incomplete_error(RELAY_SYNTHESIZED_INCOMPLETE) else {
+            panic!("the relay's synthesized terminal frame must not pass as a length cut");
+        };
+        assert!(err.is_retryable());
+        let SamplingError::StreamError {
+            error_type,
+            message,
+            ..
+        } = err
+        else {
+            panic!("expected StreamError");
+        };
+        assert_eq!(
+            (error_type.as_str(), message.as_str()),
+            (
+                "upstream_stream_incomplete",
+                "The stream ended before completion. Please retry later."
+            )
+        );
+    }
+
+    /// Only a `response.incomplete` with a top-level `code` qualifies: a real length cut, an `error` event, and text that merely mentions a code all pass through.
+    #[test]
+    fn genuine_frames_are_not_mistaken_for_relay_failures() {
+        for data in [
+            r#"{"type":"response.incomplete","sequence_number":3,"response":{"id":"resp_1","object":"response","created_at":0,"status":"incomplete","model":"m","output":[],"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            r#"{"type":"error","code":"server_error","message":"boom","sequence_number":1}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"{\"type\":\"response.incomplete\",\"code\":\"x\"}","sequence_number":2}"#,
+            r#"{"type":"response.incomplete","code":"","sequence_number":3,"response":{"id":"resp_1","object":"response","created_at":0,"status":"incomplete","model":"m","output":[]}}"#,
+        ] {
+            assert!(
+                relay_synthesized_incomplete_error(data).is_none(),
+                "misclassified: {data}"
+            );
+        }
+    }
+
+    /// End to end through the SSE decoder: the relay's synthesized frame fails the attempt retryably instead of completing with `stop_reason = Length`.
+    #[tokio::test]
+    async fn relay_synthesized_incomplete_fails_the_stream_retryably() {
+        let sse = format!(
+            "event: response.output_text.delta\ndata: {}\n\nevent: response.incomplete\ndata: {}\n\n",
+            r#"{"type":"response.output_text.delta","item_id":"msg_ft_1","output_index":0,"content_index":0,"delta":" ","sequence_number":4}"#,
+            RELAY_SYNTHESIZED_INCOMPLETE,
+        );
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let sse = sse.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = SamplingClient::new(SamplerConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_backend: ApiBackend::Responses,
+            ..minimal_config()
+        })
+        .unwrap();
+        let request = ConversationRequest {
+            items: vec![xai_grok_sampling_types::ConversationItem::user("hi")],
+            ..Default::default()
+        };
+        let (raw, metadata, doom_loop) = client
+            .conversation_stream_responses(request)
+            .await
+            .expect("stream opens");
+        let events: Vec<_> = crate::stream::stream_responses(
+            raw,
+            metadata,
+            crate::types::RequestId::random(),
+            std::time::Duration::from_secs(30),
+            doom_loop,
+        )
+        .collect()
+        .await;
+        server.abort();
+        match events.last() {
+            Some(crate::events::SamplingEvent::Failed { error, .. }) => {
+                assert!(error.is_retryable, "{error:?}");
+                assert_ne!(
+                    error.kind,
+                    crate::events::SamplingErrorKind::MaxTokensTruncation
+                );
+                assert!(
+                    error.message.contains("upstream_stream_incomplete"),
+                    "{error:?}"
+                );
+            }
+            other => panic!("expected a retryable Failed, got {other:?}"),
+        }
     }
 
     #[test]
