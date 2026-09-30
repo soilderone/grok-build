@@ -47,17 +47,26 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      # bin/protoc needs DotSlash; the build falls back to a protoc on PATH
-      - name: Install protoc
+      # bin/protoc needs DotSlash and distro protoc can predate proto3 `optional`, so fetch the exact release bin/protoc pins
+      # The build falls back to this protoc on PATH / $PROTOC
+      - name: Install the pinned protoc
         run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          else
-            brew install protobuf
-          fi
-          protoc --version
+          platform=$([ "$RUNNER_OS" = Linux ] && echo linux-x86_64 || echo macos-aarch64)
+          read -r url digest < <(python3 - "$platform" <<'EOF'
+          import json, sys
+          manifest = json.loads(open("bin/protoc").read().split("\n", 1)[1])
+          entry = manifest["platforms"][sys.argv[1]]
+          print(entry["providers"][0]["url"], entry["digest"])
+          EOF
+          )
+          curl -fsSL -o "$RUNNER_TEMP/protoc.zip" "$url"
+          echo "$digest  $RUNNER_TEMP/protoc.zip" | shasum -a 256 -c -
+          unzip -q -o "$RUNNER_TEMP/protoc.zip" -d "$RUNNER_TEMP/protoc"
+          echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+          echo "PROTOC=$RUNNER_TEMP/protoc/bin/protoc" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/protoc/bin/protoc" --version
 
       - uses: Swatinem/rust-cache@v2
         with:
